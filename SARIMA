@@ -1,0 +1,151 @@
+
+# ================================================
+ Predicting Influenza Positive Cases using SARIMA Model
+# ================================================
+
+
+
+
+# Step 1: Install and Load Necessary Libraries
+# SARIMA focuses on time series; fewer libraries are needed compared to XGBoost.
+install.packages("readxl", dependencies = TRUE)
+install.packages("dplyr", dependencies = TRUE)
+install.packages("forecast", dependencies = TRUE) # For SARIMA modeling
+install.packages("ggplot2", dependencies = TRUE)  # For visualization
+install.packages("imputeTS", dependencies = TRUE) # For missing value handling
+install.packages("zoo", dependencies = TRUE)      # For rolling averages
+library(readxl)
+library(dplyr)
+library(forecast)
+library(ggplot2)
+library(imputeTS)
+library(zoo)
+
+# Step 2: Define File Paths and Country Names
+# File paths are standardized; SARIMA outputs are saved separately.
+file_path <- "/Users/turkialmalki/Desktop/Influenza modelling/Influenza_Data_2010-2024_GCCc.xlsx"
+output_path <- "/Users/turkialmalki/Desktop/Influenza modelling/SARIMA 2010-2024"
+
+# Ensure the output directory exists
+if (!dir.exists(output_path)) {
+  dir.create(output_path, recursive = TRUE)
+}
+
+countries <- c("KSA", "UAE", "Oman", "Qatar", "Bahrain")
+data_list <- lapply(countries, function(country) {
+  read_excel(file_path, sheet = country)
+})
+names(data_list) <- countries
+
+# Step 3: Data Preprocessing
+# Missing values are handled, and smoothing is applied to ensure consistent quality.
+data_list <- lapply(data_list, function(data) {
+  # Ensure Date is in proper format
+  data <- data %>%
+    mutate(Date = as.Date(Date, format = "%Y-%m-%d"))
+  
+  # Separate training and test data ranges
+  train_data <- data %>% filter(Date < as.Date("2024-01-01"))
+  test_data <- data %>% filter(Date >= as.Date("2024-01-01"))
+  
+  # Apply preprocessing only to training data
+  train_data <- train_data %>%
+    mutate(
+      `Influenza positive` = na_seadec(`Influenza positive`, find_frequency = TRUE),
+      `Influenza positive` = tsclean(`Influenza positive`),
+      `Influenza positive` = rollmean(`Influenza positive`, k = 3, fill = NA, align = "right")
+    )
+  
+  # Combine processed training data with unaltered test data
+  processed_data <- bind_rows(train_data, test_data)
+  
+  return(processed_data)
+})
+
+# Step 4: Define Training, Testing, and Prediction Periods
+date_ranges <- list(
+  KSA = c("2017-01-16", "2024-11-18"),
+  UAE = c("2019-12-30", "2024-11-11"),
+  Oman = c("2010-01-04", "2024-09-23"),
+  Qatar = c("2011-01-03", "2024-11-11"),
+  Bahrain = c("2011-08-01", "2024-11-25")
+)
+
+prediction_range <- list(
+  start = "2024-12-01",
+  end = "2025-02-28"
+)
+
+# Step 5: Apply SARIMA for Each Country
+results <- lapply(countries, function(country) {
+  range <- date_ranges[[country]]
+  data <- data_list[[country]] %>%
+    filter(Date >= as.Date(range[1]) & Date <= as.Date(range[2]))
+  
+  train_data <- data %>% filter(Date < as.Date("2024-01-01"))
+  test_data <- data %>% filter(Date >= as.Date("2024-01-01"))
+  
+  # Step 6: Fit SARIMA Model
+  sarima_model <- auto.arima(train_data$`Influenza positive`, seasonal = TRUE)
+  
+  # Step 7: Test Predictions
+  test_predictions <- forecast(sarima_model, h = nrow(test_data))$mean
+  rmse_test <- sqrt(mean((test_predictions - test_data$`Influenza positive`)^2, na.rm = TRUE))
+  mae_test <- mean(abs(test_predictions - test_data$`Influenza positive`), na.rm = TRUE)
+  mse_test <- mean((test_predictions - test_data$`Influenza positive`)^2, na.rm = TRUE)
+  
+  # Step 8: Forecast Future
+  forecast_dates <- seq(as.Date(prediction_range$start), as.Date(prediction_range$end), by = "week")
+  future_forecast <- forecast(sarima_model, h = length(forecast_dates))$mean
+  
+  # Step 9: Calculate Mean Observed Value for Test Period
+  mean_observed <- mean(test_data$`Influenza positive`, na.rm = TRUE)
+  
+  # Step 10: Save Outputs
+  metrics <- data.frame(RMSE = rmse_test, MAE = mae_test, MSE = mse_test, Mean_Observed = mean_observed)
+  write.csv(metrics, file.path(output_path, paste0(country, "_Metrics.csv")), row.names = FALSE)
+  
+  test_results <- data.frame(Date = test_data$Date, Actual = test_data$`Influenza positive`, Predicted = test_predictions)
+  write.csv(test_results, file.path(output_path, paste0(country, "_Test_Predictions.csv")), row.names = FALSE)
+  
+  forecast_results <- data.frame(Date = forecast_dates, Predicted = future_forecast)
+  write.csv(forecast_results, file.path(output_path, paste0(country, "_Forecast.csv")), row.names = FALSE)
+  
+  # Save Test and Forecast Plots
+  test_plot <- ggplot(test_results, aes(x = Date)) +
+    geom_line(aes(y = Actual, color = "Actual"), size = 1) +
+    geom_line(aes(y = Predicted, color = "Predicted"), size = 1, linetype = "dashed") +
+    labs(title = paste("Test Period Trends for", country),
+         x = "Date", y = "Cases", color = "Legend") +
+    scale_color_manual(values = c("Actual" = "blue", "Predicted" = "red")) +
+    theme_minimal()
+  ggsave(file.path(output_path, paste0(country, "_Test_Plot.png")), test_plot)
+  
+  forecast_plot <- ggplot(forecast_results, aes(x = Date, y = Predicted)) +
+    geom_line(color = "darkgreen", size = 1) +
+    labs(title = paste("Forecast Trends for", country),
+         x = "Date", y = "Forecasted Cases") +
+    theme_minimal()
+  ggsave(file.path(output_path, paste0(country, "_Forecast_Plot.png")), forecast_plot)
+  
+  # Return Results
+  list(
+    country = country,
+    metrics = metrics,
+    test_predictions = test_results,
+    forecast = forecast_results
+  )
+})
+
+# Step 11: Save and Display Performance Summary
+performance_summary <- do.call(rbind, lapply(results, function(result) {
+  data.frame(
+    Country = result$country,
+    RMSE = result$metrics$RMSE,
+    MAE = result$metrics$MAE,
+    MSE = result$metrics$MSE,
+    Mean_Observed = result$metrics$Mean_Observed
+  )
+}))
+write.csv(performance_summary, file.path(output_path, "Performance_Summary.csv"), row.names = FALSE)
+print(performance_summary)
