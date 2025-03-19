@@ -1,0 +1,240 @@
+# ================================================
+ Predicting Influenza Positive Cases using XGBoost Model
+# ================================================
+
+
+
+
+
+# Step 1: Install and Load Necessary Libraries
+install.packages("readxl", dependencies = TRUE)
+install.packages("dplyr", dependencies = TRUE)
+install.packages("xgboost", dependencies = TRUE)
+install.packages("ggplot2", dependencies = TRUE)
+install.packages("imputeTS", dependencies = TRUE)
+install.packages("caret", dependencies = TRUE)
+install.packages("forecast", dependencies = TRUE) # For alternative models
+install.packages("zoo", dependencies = TRUE) # For smoothing
+library(readxl)
+library(dplyr)
+library(xgboost)
+library(ggplot2)
+library(imputeTS)
+library(caret)
+library(forecast)
+library(zoo)
+
+# Step 2: Define File Paths and Country Names
+file_path <- "/Users/turkialmalki/Desktop/Influenza modelling/Influenza_Data_2010-2024_GCCc.xlsx"
+output_path <- "/Users/turkialmalki/Desktop/Influenza modelling"
+countries <- c("KSA", "UAE", "Oman", "Qatar", "Bahrain")
+data_list <- lapply(countries, function(country) {
+  read_excel(file_path, sheet = country)
+})
+names(data_list) <- countries
+
+# Step 3: Data Preprocessing with Enhanced NA Handling
+data_list <- lapply(data_list, function(data) {
+  data <- data %>%
+    mutate(
+      Date = as.Date(Date, format = "%Y-%m-%d"),
+      `Influenza positive` = na_seadec(`Influenza positive`, find_frequency = TRUE)
+    ) %>%
+    mutate(
+      `Influenza positive` = tsclean(`Influenza positive`),
+      `Influenza positive` = ifelse(is.na(`Influenza positive`), 0, `Influenza positive`)
+    ) %>%
+    mutate(
+      `Influenza positive` = rollmean(`Influenza positive`, k = 3, fill = NA, align = "right"),
+      `Influenza positive` = ifelse(is.na(`Influenza positive`), 0, `Influenza positive`)
+    )
+  return(data)
+})
+
+# Step 4: Define Training, Testing, and Prediction Periods
+date_ranges <- list(
+  KSA = c("2017-01-16", "2024-11-18"),
+  UAE = c("2019-12-30", "2024-11-11"),
+  Oman = c("2010-01-04", "2024-09-23"),
+  Qatar = c("2011-01-03", "2024-11-11"),
+  Bahrain = c("2011-08-01", "2024-11-25")
+)
+
+prediction_range <- list(
+  start = "2024-12-01",
+  end = "2025-02-28"
+)
+
+# Step 5: Split Data into Train, Test, and Prediction Periods
+split_data <- function(data, start_date, end_date, test_start, pred_start, pred_end) {
+  data <- data %>% filter(Date >= as.Date(start_date) & Date <= as.Date(end_date))
+  list(
+    train = data %>% filter(Date < as.Date(test_start)),
+    test = data %>% filter(Date >= as.Date(test_start)),
+    predict_dates = seq(as.Date(pred_start), as.Date(pred_end), by = "week")
+  )
+}
+
+# Step 6: Prepare Data for XGBoost Model
+prepare_xgb <- function(data) {
+  data <- data %>%
+    mutate(
+      sin_date = sin(2 * pi * as.numeric(Date) / 365.25),
+      cos_date = cos(2 * pi * as.numeric(Date) / 365.25)
+    )
+  x <- as.matrix(data %>% select(sin_date, cos_date))
+  y <- data$`Influenza positive`
+  list(x = x, y = y)
+}
+
+# Step 7: Train and Validate XGBoost Model
+train_validate_xgb <- function(train_data) {
+  train_control <- trainControl(method = "cv", number = 5, verboseIter = FALSE)
+  xgb_grid <- expand.grid(
+    nrounds = c(100, 200, 300),
+    max_depth = c(6, 8, 10),
+    eta = c(0.05, 0.1, 0.15),
+    gamma = c(0, 1, 2),
+    colsample_bytree = c(0.8, 1),
+    min_child_weight = c(1, 2),
+    subsample = c(0.8, 1)
+  )
+  train(
+    x = train_data$x,
+    y = train_data$y,
+    method = "xgbTree",
+    trControl = train_control,
+    tuneGrid = xgb_grid,
+    metric = "RMSE"
+  )
+}
+
+# Step 8: Apply the Process for Each Country
+results <- lapply(countries, function(country) {
+  range <- date_ranges[[country]]
+  split <- split_data(
+    data_list[[country]],
+    start_date = range[1],
+    end_date = range[2],
+    test_start = "2024-01-01",
+    pred_start = prediction_range$start,
+    pred_end = prediction_range$end
+  )
+  
+  train_xgb <- prepare_xgb(split$train)
+  test_xgb <- prepare_xgb(split$test)
+  
+  xgb_model <- train_validate_xgb(train_xgb)
+  
+  pred_test <- predict(xgb_model$finalModel, test_xgb$x)
+  rmse_test <- sqrt(mean((pred_test - test_xgb$y)^2))
+  mae_test <- mean(abs(pred_test - test_xgb$y))
+  mse_test <- mean((pred_test - test_xgb$y)^2)
+  
+  future_x <- as.matrix(data.frame(
+    sin_date = sin(2 * pi * as.numeric(split$predict_dates) / 365.25),
+    cos_date = cos(2 * pi * as.numeric(split$predict_dates) / 365.25)
+  ))
+  pred_future <- predict(xgb_model$finalModel, future_x)
+  
+  metrics <- data.frame(
+    RMSE = rmse_test,
+    MAE = mae_test,
+    MSE = mse_test
+  )
+  
+  test_predictions <- data.frame(Date = split$test$Date, Actual = test_xgb$y, Predicted = pred_test)
+  forecast <- data.frame(Date = split$predict_dates, Predicted = pred_future)
+  
+  # Save Outputs
+  write.csv(metrics, file.path(output_path, paste0(country, "_Metrics.csv")), row.names = FALSE)
+  write.csv(test_predictions, file.path(output_path, paste0(country, "_Test_Predictions.csv")), row.names = FALSE)
+  write.csv(forecast, file.path(output_path, paste0(country, "_Forecast.csv")), row.names = FALSE)
+  
+  # Save Test Period Plots
+  test_plot <- ggplot(test_predictions, aes(x = Date)) +
+    geom_line(aes(y = Actual, color = "Actual"), size = 1) +
+    geom_line(aes(y = Predicted, color = "Predicted"), size = 1, linetype = "dashed") +
+    labs(title = paste("Test Period Trends for", country),
+         x = "Date", y = "Cases", color = "Legend") +
+    scale_color_manual(values = c("Actual" = "blue", "Predicted" = "red")) +
+    theme_minimal()
+  ggsave(file.path(output_path, paste0(country, "_Test_Plot.png")), test_plot)
+  
+  # Save Forecast Plots
+  forecast_plot <- ggplot(forecast, aes(x = Date, y = Predicted)) +
+    geom_line(color = "darkgreen", size = 1) +
+    labs(title = paste("Forecast Trends for", country),
+         x = "Date", y = "Forecasted Cases") +
+    theme_minimal()
+  ggsave(file.path(output_path, paste0(country, "_Forecast_Plot.png")), forecast_plot)
+  
+  list(
+    country = country,
+    metrics = metrics,
+    test_predictions = test_predictions,
+    forecast = forecast
+  )
+})
+
+# Step 9: Display Results in the Console
+print(results)
+
+
+
+# Step 10: Save Performance Summary for All Countries
+# Combine metrics for all countries into one data frame
+performance_summary <- do.call(rbind, lapply(results, function(result) {
+  data.frame(
+    Country = result$country,
+    RMSE = result$metrics$RMSE,
+    MAE = result$metrics$MAE,
+    MSE = result$metrics$MSE
+  )
+}))
+
+# Save performance summary to a CSV file
+write.csv(performance_summary, file.path(output_path, "Performance_Summary.csv"), row.names = FALSE)
+
+# Print performance summary in the console
+print(performance_summary)
+
+# Step 11: Plot Test Period Trends for Each Country
+for (i in seq_along(results)) {
+  country_name <- results[[i]]$country
+  test_data <- results[[i]]$test_predictions
+  
+  if (!is.null(test_data) && nrow(test_data) > 0) {
+    test_plot <- ggplot(test_data, aes(x = Date)) +
+      geom_line(aes(y = Actual, color = "Actual"), size = 1) +
+      geom_line(aes(y = Predicted, color = "Predicted"), size = 1, linetype = "dashed") +
+      labs(title = paste("Test Period Trends for", country_name),
+           x = "Date", y = "Cases", color = "Legend") +
+      scale_color_manual(values = c("Actual" = "blue", "Predicted" = "red")) +
+      theme_minimal()
+    print(test_plot)
+    # Save Test Period Plot
+    ggsave(file.path(output_path, paste0(country_name, "_Test_Plot.png")), test_plot)
+  } else {
+    message(paste("No test data available for", country_name))
+  }
+}
+
+# Step 12: Plot Forecast Trends for Each Country
+for (i in seq_along(results)) {
+  country_name <- results[[i]]$country
+  forecast_data <- results[[i]]$forecast
+  
+  if (!is.null(forecast_data) && nrow(forecast_data) > 0) {
+    forecast_plot <- ggplot(forecast_data, aes(x = Date, y = Predicted)) +
+      geom_line(color = "darkgreen", size = 1) +
+      labs(title = paste("Forecast Trends for", country_name),
+           x = "Date", y = "Forecasted Cases") +
+      theme_minimal()
+    print(forecast_plot)
+    # Save Forecast Plot
+    ggsave(file.path(output_path, paste0(country_name, "_Forecast_Plot.png")), forecast_plot)
+  } else {
+    message(paste("No forecast data available for", country_name))
+  }
+}
